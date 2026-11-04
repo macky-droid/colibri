@@ -1,4 +1,11 @@
 #include "backend_cuda_dsv4.h"
+
+/* Vendor-neutral log identity: the same source is built by nvcc and hipcc. */
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+#define COLI_DSV4_LOG_TAG "[DSV4 HIP]"
+#else
+#define COLI_DSV4_LOG_TAG "[DSV4 CUDA]"
+#endif
 #include "backend_gpu_compat.h"
 #include <chrono>
 #if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__)
@@ -115,7 +122,7 @@ static long long g_budget[16], g_used[16];
 static int budget_charge(int device, long long bytes);
 static void budget_release(int device, long long bytes);
 #if COLI_DSV4_TC
-static int bok(cublasStatus_t e,const char*s){if(e==CUBLAS_STATUS_SUCCESS)return 1;fprintf(stderr,"[DSV4 CUDA] %s: cuBLAS status %d\n",s,(int)e);return 0;}
+static int bok(cublasStatus_t e,const char*s){if(e==CUBLAS_STATUS_SUCCESS)return 1;fprintf(stderr,COLI_DSV4_LOG_TAG " %s: cuBLAS status %d\n",s,(int)e);return 0;}
 #endif
 #ifdef COLI_DSV4_NCCL
 static int nok(ncclResult_t e,const char*s){if(e==ncclSuccess)return 1;fprintf(stderr,"[DSV4 NCCL] %s: %s\n",s,ncclGetErrorString(e));return 0;}
@@ -324,7 +331,7 @@ static void run_mm_batch(Dsv4CudaTensor*t,const float*x,float*y,int T,cudaStream
     static int mw=-1,mw_env=1,mwv=0;static unsigned long long vcalls=0,vbad=0;
     if(mw<0){const char*e=getenv("DSV4_MM_WARP");mw_env=!e||!*e||!strcmp(e,"auto")?1:atoi(e)!=0?2:0;mw=mw_env;
         e=getenv("DSV4_MM_WARP_VERIFY");mwv=e&&atoi(e)!=0;
-        if(mwv&&!mw){mw=1;fprintf(stderr,"[DSV4 CUDA] DSV4_MM_WARP_VERIFY=1 overrides DSV4_MM_WARP=0: the warp kernel runs beside mm_batch on the auto shapes, mm_batch's results are kept\n");}}
+        if(mwv&&!mw){mw=1;fprintf(stderr,COLI_DSV4_LOG_TAG " DSV4_MM_WARP_VERIFY=1 overrides DSV4_MM_WARP=0: the warp kernel runs beside mm_batch on the auto shapes, mm_batch's results are kept\n");}}
     if(mw&&(t->fmt==8||t->fmt==9)&&t->I%256==0&&(mw==2||t->I<=1024)){
         size_t n=(size_t)T*t->O;Dev*c=mwv?ctx(t->device):nullptr;
         /* verify buffers are per device; without them verify switches itself
@@ -332,7 +339,7 @@ static void run_mm_batch(Dsv4CudaTensor*t,const float*x,float*y,int T,cudaStream
          * overridden 0 sends this call to mm_batch below) */
         if(mwv&&(!c||!buf((void**)&c->mmv,&c->mmvcap,n*sizeof(float))||
                  (!c->mmvcount&&!alloc_ok(cudaMalloc(&c->mmvcount,sizeof(*c->mmvcount)),"mm-warp verify counter")))){
-            mwv=0;mw=mw_env;fprintf(stderr,"[DSV4 CUDA] DSV4_MM_WARP_VERIFY off: no memory for its buffers\n");}
+            mwv=0;mw=mw_env;fprintf(stderr,COLI_DSV4_LOG_TAG " DSV4_MM_WARP_VERIFY off: no memory for its buffers\n");}
         if(mw){
             dim3 wg((t->O+7)/8,(T+7)/8);float*dst=mwv?c->mmv:y;
             if(t->fmt==9)mm_batch_w<9,8><<<wg,256,0,stream>>>((uint8_t*)t->w,t->scale,x,dst,t->O,t->I,T);
@@ -2651,7 +2658,7 @@ static TcPlan *tc_plan(Dev*c,int O,int I){int pi=O>I;TcPlan*p=&c->plans[pi];if(p
     cublasLtMatmulPreference_t pref=NULL;size_t wsz=32<<20;int found=0;if(!bok(cublasLtMatmulPreferenceCreate(&pref),"TC preference")||
        !bok(cublasLtMatmulPreferenceSetAttribute(pref,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&wsz,sizeof(wsz)),"TC workspace preference")||
        !bok(cublasLtMatmulAlgoGetHeuristic(c->lt,p->op,p->a,p->b,p->c,p->d,pref,1,&p->algo,&found),"TC heuristic")){if(pref)cublasLtMatmulPreferenceDestroy(pref);return NULL;}
-    cublasLtMatmulPreferenceDestroy(pref);if(!found){fprintf(stderr,"[DSV4 CUDA] no MXFP8 Tensor Core plan O=%d I=%d\n",O,I);return NULL;}p->ok=1;return p;}
+    cublasLtMatmulPreferenceDestroy(pref);if(!found){fprintf(stderr,COLI_DSV4_LOG_TAG " no MXFP8 Tensor Core plan O=%d I=%d\n",O,I);return NULL;}p->ok=1;return p;}
 static int tc_prepare_x(Dev*c,const float*x,int I){size_t sb=(size_t)((I+127)/128)*4*128;if(!buf((void**)&c->tcx,&c->tcxcap,I)||!buf((void**)&c->tcxs,&c->tcxscap,sb))return 0;
     if(!ok(cudaMemsetAsync(c->tcxs,0,sb,c->stream),"TC activation scale clear"))return 0;tc_quant<<<(I+127)/128,128,0,c->stream>>>(x,c->tcx,c->tcxs,I);return ok(cudaGetLastError(),"TC activation quantize");}
 static int tc_fp4_matvec(Dev*c,Dsv4CudaTensor*t,float*y){int O=t->O,I=t->I;size_t wb=(size_t)O*I,sb=(size_t)((I+127)/128)*4*((O+127)/128)*128;
@@ -3367,7 +3374,7 @@ extern "C" int dsv4_cuda_route_moe(const Dsv4CudaActivation*input,Dsv4CudaTensor
 #ifdef COLI_DSV4_DEEPGEMM
     static int deepgemm=-1;if(deepgemm<0)deepgemm=getenv("DSV4_CUDA_DEEPGEMM")?atoi(getenv("DSV4_CUDA_DEEPGEMM")):1;
     if(deepgemm){
-        static int announced;if(!announced++){fprintf(stderr,"[DSV4 CUDA] DeepGEMM routed experts active\n");}
+        static int announced;if(!announced++){fprintf(stderr,COLI_DSV4_LOG_TAG " DeepGEMM routed experts active\n");}
         int ab=getenv("DSV4_CUDA_DG_AB")&&atoi(getenv("DSV4_CUDA_DG_AB"));
         if(ab){
             if(!buf((void**)&c->dgref,&c->dgrefcap,hb))return 0;
@@ -3438,7 +3445,7 @@ extern "C" int dsv4_cuda_route_moe_batch(const Dsv4CudaActivation*input,Dsv4Cuda
     size_t mid=(size_t)count*2048*sizeof(float),hb=(size_t)count*4096*sizeof(float);if(!buf((void**)&c->p1,&c->p1cap,mid)||!buf((void**)&c->p2,&c->p2cap,mid)||!buf((void**)&c->p3,&c->p3cap,mid)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
     if(!dg_dense_batch_dispatch(c,sg,input->data,c->p1,count)||!dg_dense_batch_dispatch(c,su,input->data,c->p2,count))return 0;swiglu_rows<<<((long long)count*2048+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count,2048);if(!dg_dense_batch_dispatch(c,sd,c->p3,c->p4,count))return 0;add_rows<<<((long long)count*4096+255)/256,256,0,c->stream>>>(output->data,c->p4,count*4096);
     if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);tb=std::chrono::steady_clock::now();t_shared=std::chrono::duration<double>(tb-ta).count();
-        fprintf(stderr,"[DSV4 CUDA] moe-batch prof count=%d experts=%.3fs shared=%.3fs\n",count,t_expert,t_shared);prof_calls++;}
+        fprintf(stderr,COLI_DSV4_LOG_TAG " moe-batch prof count=%d experts=%.3fs shared=%.3fs\n",count,t_expert,t_shared);prof_calls++;}
     return ok(cudaGetLastError(),"batched MoE launch");
 #else
     (void)input;(void)gate;(void)bias;(void)tokens;(void)count;(void)scale;(void)set;(void)limit;(void)output;return 0;
@@ -3490,7 +3497,7 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     if(!dg_dense_batch_dispatch(c,sd,c->p3,c->p4,count))return 0;
     add_rows<<<((long long)count*4096+255)/256,256,0,c->stream>>>(output->data,c->p4,count*4096);
     if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);tb=std::chrono::steady_clock::now();t_shared=std::chrono::duration<double>(tb-ta).count();
-        fprintf(stderr,"[DSV4 CUDA] moe-ids prof count=%d experts=%.3fs shared=%.3fs\n",count,t_expert,t_shared);prof_calls++;}
+        fprintf(stderr,COLI_DSV4_LOG_TAG " moe-ids prof count=%d experts=%.3fs shared=%.3fs\n",count,t_expert,t_shared);prof_calls++;}
     return ok(cudaGetLastError(),"batched MoE ids launch");
 #else
     /* GENERIC batched MoE (no DeepGEMM): the decode kernels applied to every
@@ -3527,9 +3534,9 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     static int em_mode=-1,em_mode_env=1,em_verify=0,em_tb=0;static unsigned long long em_calls=0,em_bad1=0,em_bad2=0;
     if(em_mode<0){const char*v=getenv("DSV4_MOE_EXPERT_MAJOR");em_mode_env=v?atoi(v)!=0:1;em_mode=em_mode_env;
         v=getenv("DSV4_MOE_EM_TB");if(v&&*v){em_tb=atoi(v);
-            if(em_tb!=2&&em_tb!=3&&em_tb!=4&&em_tb!=6){fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EM_TB=%s ignored (2, 3, 4 or 6): TB by route density\n",v);em_tb=0;}}
+            if(em_tb!=2&&em_tb!=3&&em_tb!=4&&em_tb!=6){fprintf(stderr,COLI_DSV4_LOG_TAG " DSV4_MOE_EM_TB=%s ignored (2, 3, 4 or 6): TB by route density\n",v);em_tb=0;}}
         v=getenv("DSV4_MOE_EXPERT_MAJOR_VERIFY");em_verify=v&&atoi(v)!=0;
-        if(em_verify&&!em_mode){em_mode=1;fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EXPERT_MAJOR_VERIFY=1 overrides DSV4_MOE_EXPERT_MAJOR=0: the expert-major kernel runs beside the per-route one, whose results are kept\n");}}
+        if(em_verify&&!em_mode){em_mode=1;fprintf(stderr,COLI_DSV4_LOG_TAG " DSV4_MOE_EXPERT_MAJOR_VERIFY=1 overrides DSV4_MOE_EXPERT_MAJOR=0: the expert-major kernel runs beside the per-route one, whose results are kept\n");}}
     int nex=0;const int*em_ex=nullptr,*em_off=nullptr,*em_rt=nullptr;
     if(em_mode){
         int cnt[256]={0},slot_of[256];for(int r=0;r<routes;r++)cnt[ids[r]]++;
@@ -3547,7 +3554,7 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
          * again (an overridden 0 sends this call down the per-route path) */
         if(em_verify&&(!buf((void**)&c->emv1,&c->emv1cap,rb)||!buf((void**)&c->emv2,&c->emv2cap,rb)||!buf((void**)&c->emv4,&c->emv4cap,pb)||
            (!c->emcount&&!alloc_ok(cudaMalloc(&c->emcount,2*sizeof(unsigned long long)),"expert-major verify counter")))){
-            em_verify=0;em_mode=em_mode_env;fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EXPERT_MAJOR_VERIFY off: no memory for its buffers\n");}
+            em_verify=0;em_mode=em_mode_env;fprintf(stderr,COLI_DSV4_LOG_TAG " DSV4_MOE_EXPERT_MAJOR_VERIFY off: no memory for its buffers\n");}
     }
     const int tb=em_tb?em_tb:routes<4*nex?2:4;
     /* the per-route kernel's descriptor tables: per-route mode and verify only */
