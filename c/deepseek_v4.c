@@ -11917,6 +11917,11 @@ int coli_v4_engine_open(ColiV4Engine **output,
         options->context_tokens > 0 ? options->context_tokens : 4096;
     engine->runtime.repin_interval = options->repin_interval;
     engine->runtime.pin_slots_per_layer = options->pin_slots_per_layer;
+    engine->gpu.request_off = options->gpu_off;
+    engine->gpu.request_device_set = options->gpu_device_set;
+    engine->gpu.request_device = options->gpu_device;
+    engine->gpu.request_workload = options->gpu_workload;
+    engine->gpu.request_budget_bytes = (long long)options->gpu_budget_bytes;
 
     /* Set owns_* immediately after each acquire so destroy cleans partial opens. */
     if (coli_v4_config_load(&engine->config, engine->runtime.target_model_dir,
@@ -12036,6 +12041,7 @@ fail:
 #include "backend_cuda_dsv4.h"
 #include "deepseek_v4_bank_pair.h"
 #include "deepseek_v4_gpu_devices.h"
+#include "deepseek_v4_gpu_plan.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12045,11 +12051,18 @@ fail:
  * batched attention's helpers take it where a layer has no FP8 mirror to find it by (a GGUF) */
 static int g_v4_gpu_open_device = -1;
 
-static int v4_gpu_wanted(void) {
+static int v4_gpu_wanted(const ColiV4Engine *engine) {
+    if (engine && engine->gpu.request_off) return 0;
     const char *setting = getenv("DSV4_CUDA");
     if (setting && atoi(setting) == 0) return 0;
     return 1;
 }
+
+/* Plan globals: the bank and reserve paths live in functions that do not
+ * carry the engine pointer, the same process has one engine. */
+static int g_v4_gpu_plan_bank = -1;
+static long long g_v4_gpu_plan_reserve_mb = -1;
+extern int coli_v4_gpu_attn_default;
 
 typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
 /* Peer mirror pool (DSV4_CUDA_PEER_DEVICE): a second cache on another GPU.
@@ -12091,15 +12104,32 @@ static void v4_gpu_route_scratch_clear(void) {
     }
 }
 
-static int v4_gpu_dense_wanted(void);
+static int v4_gpu_dense_wanted(const ColiV4Engine *engine);
 
 int g_v4_gpu_mirror_on;   /* defined in the GPU unit, read by the expert store */
+
+/* Dense/attention bytes from the layer plans, not from runtime state: the
+ * planner runs before the resident layers have been loaded, so
+ * dense_resident.total_bytes is still zero here. */
+static long long v4_gpu_dense_bytes_estimate(const ColiV4Engine *engine) {
+    long long total = 0;
+    if (!engine) return 0;
+    for (int layer = 0; layer < engine->config.num_hidden_layers; layer++) {
+        ColiDeepSeekV4LayerPlan plan;
+        if (coli_v4_layer_plan(&plan, &engine->config, layer, NULL, 0))
+            return 0;
+        for (size_t i = 0; i < plan.tensor_count; i++)
+            if (coli_v4_dense_device_only_tensor(&plan.tensors[i]))
+                total += (long long)coli_v4_dense_tensor_bytes(&plan.tensors[i]);
+    }
+    return total;
+}
 
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
     engine->gpu.enabled = 0;
     engine->gpu.device = 0;
-    if (!v4_gpu_wanted()) return 0;
+    if (!v4_gpu_wanted(engine)) return 0;
 #ifdef COLI_VULKAN
     {   /* This path mirrors native FP4 experts and FP8 and bf16 matrices only
          * (v4_gpu_expert_attach_cached_ex): a GGUF's experts and dense part stayed on the CPU
@@ -12120,10 +12150,14 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     }
 #endif
     /* #1766: DSV4_CUDA_DEVICES places contiguous layer ranges on several
-     * GPUs; without it DSV4_CUDA_DEVICE names the one device. */
+     * GPUs; without it DSV4_CUDA_DEVICE names the one device. An explicit
+     * --gpu device from the placement request wins over the old environment
+     * variable, because the launcher is the public contract. */
     const char *setting = getenv("DSV4_CUDA_DEVICES");
     int count = 1;
-    if (setting) {
+    if (engine->gpu.request_device_set) {
+        engine->gpu.devices[0] = engine->gpu.request_device;
+    } else if (setting) {
         count = coli_v4_gpu_devices_parse(setting, engine->gpu.devices);
     } else {
         const char *device_setting = getenv("DSV4_CUDA_DEVICE");
@@ -12217,20 +12251,93 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     engine->gpu.device = device;
     g_v4_gpu_open_device = device;
     g_v4_gpu_mirror_on = 1;
-    v4_gpu_mirror_reserve_size(&engine->config,
-                               !coli_v4_index_gguf(engine->target_index));
-    /* Routed-expert fp4 mirror caches hang off the expert store, one per
-     * device and layer range (#1766); with one device a single cache covers
-     * every layer, as before. Each grows only while its card's VRAM reserve
-     * stays free. */
+    /* The placement plan is per card. With one device it decides every tier;
+     * with DSV4_CUDA_DEVICES the existing contiguous-layer placement stays in
+     * charge, because its per-card layer ranges and peer pool are not a single
+     * budget. Do not silently apply one card's plan to several cards. */
+    if (count == 1) {
+        long long free_bytes = dsv4_cuda_mem_free_mb(device) * (1LL << 20);
+        long long hidden = engine->config.hidden_size;
+        long long intermediate = engine->config.moe_intermediate_size;
+        long long layers = engine->config.num_hidden_layers;
+        long long dense_bytes = v4_gpu_dense_bytes_estimate(engine);
+        if (dense_bytes <= 0)
+            dense_bytes = (long long)engine->dense_resident.total_bytes;
+        long long shared_bytes = layers * (3 * hidden * intermediate +
+                                           3 * hidden * intermediate / 32);
+        long long bank_bytes = dsv4_cuda_expert_bank_slots(
+                                   engine->config.n_routed_experts) *
+                               dsv4_cuda_expert_bank_slot_bytes(
+                                   (int)hidden, (int)intermediate);
+        long long mirror_bytes = 3 * (intermediate * hidden / 2 +
+                                      intermediate * hidden / 32);
+        long long kv_bytes = (long long)engine->runtime.context_tokens *
+                                 (128LL << 10) + (128LL << 20);
+        V4GpuPlanRequest request;
+        V4GpuPlan plan;
+        memset(&request, 0, sizeof(request));
+        request.backend_ok = 1;
+        request.workload = engine->gpu.request_workload;
+        request.budget_bytes = engine->gpu.request_budget_bytes;
+        request.free_bytes = free_bytes;
+        request.dense_bytes = dense_bytes;
+        request.shared_bytes = shared_bytes;
+        request.bank_bytes = bank_bytes;
+        request.kv_bytes = kv_bytes;
+        request.mirror_bytes = mirror_bytes;
+        request.n_experts = engine->config.n_routed_experts;
+        request.safety_bytes = V4_GPU_PLAN_DEFAULT_SAFETY_BYTES;
+        plan = v4_gpu_plan_decide(&request);
+        engine->gpu.plan_valid = 1;
+        engine->gpu.plan_budget_bytes = request.budget_bytes;
+        engine->gpu.plan_free_bytes = free_bytes;
+        engine->gpu.plan_dense = plan.dense;
+        engine->gpu.plan_shared = plan.shared;
+        engine->gpu.plan_bank = plan.bank;
+        engine->gpu.plan_attn = plan.attn;
+        engine->gpu.plan_mirror_slots = plan.mirror_slots;
+        engine->gpu.plan_reserve_bytes = plan.reserve_bytes;
+        g_v4_gpu_plan_bank = plan.bank;
+        g_v4_gpu_plan_reserve_mb = plan.reserve_bytes >> 20;
+        if (!getenv("COLI_CUDA_ATTN_BATCH"))
+            coli_v4_gpu_attn_default = plan.attn;
+        fprintf(stderr,
+                "v4_gpu plan device=%d budget=%lldMiB free=%lldMiB "
+                "dense=%d shared=%d bank=%d attn=%d mirrors=%d "
+                "reserve=%lldMiB used=%lldMiB\n",
+                device, request.budget_bytes > 0
+                            ? (request.budget_bytes > free_bytes
+                                   ? free_bytes : request.budget_bytes) >> 20
+                            : free_bytes >> 20,
+                free_bytes >> 20, plan.dense, plan.shared, plan.bank,
+                plan.attn, plan.mirror_slots, plan.reserve_bytes >> 20,
+                plan.used_bytes >> 20);
+    } else {
+        fprintf(stderr, "v4_gpu plan=off multi-device devices=%d; "
+                        "contiguous-layer placement keeps its per-card budgets\n",
+                count);
+    }
+    if (!engine->gpu.plan_valid)
+        v4_gpu_mirror_reserve_size(&engine->config,
+                                   !coli_v4_index_gguf(engine->target_index));
     if (engine->experts && !engine->experts->gpu) {
-        engine->experts->gpu = v4_gpu_expert_mirrors_create_devices(
-            engine->gpu.devices, count, engine->config.num_hidden_layers);
-        if (!engine->experts->gpu) {
-            coli_v4_gpu_engine_close(engine);
-            return -1;
+        if (count == 1 && engine->gpu.plan_valid) {
+            if (engine->gpu.plan_mirror_slots >= V4_GPU_PLAN_MIN_MIRRORS ||
+                getenv("DSV4_CUDA_EXPERT_MIRRORS"))
+                engine->experts->gpu = v4_gpu_expert_mirrors_create(
+                    device, engine->gpu.plan_mirror_slots > 0
+                                ? engine->gpu.plan_mirror_slots
+                                : V4_GPU_PLAN_MIN_MIRRORS);
+        } else {
+            engine->experts->gpu = v4_gpu_expert_mirrors_create_devices(
+                engine->gpu.devices, count, engine->config.num_hidden_layers);
+            if (!engine->experts->gpu) {
+                coli_v4_gpu_engine_close(engine);
+                return -1;
+            }
         }
     }
+    g_v4_gpu_mirror_on = engine->experts && engine->experts->gpu ? 1 : 0;
     /* VRAM-first decode never asks the store for a mirrored expert: its RAM
      * pin ranking leaves them out (the peer pool's too, once there is one). */
     if (engine->experts && engine->experts->gpu &&
@@ -12247,7 +12354,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     }
     if (count > 1) {
         fprintf(stderr, "v4_gpu tier=%s device=%d devices=%d placement=contiguous-layers\n",
-                v4_gpu_dense_wanted() ? "dense-matvec" : "expert-mirror",
+                v4_gpu_dense_wanted(engine) ? "dense-matvec" : "expert-mirror",
                 device, count);
         for (int i = 0; i < count; i++)
             fprintf(stderr, "v4_gpu device=%d layers=%d..%d\n", engine->gpu.devices[i],
@@ -12255,7 +12362,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
                     coli_v4_gpu_layer_begin(i + 1, count, engine->config.num_hidden_layers) - 1);
     } else {
         fprintf(stderr, "v4_gpu tier=%s device=%d\n",
-                v4_gpu_dense_wanted() ? "dense-matvec" : "expert-mirror", device);
+                v4_gpu_dense_wanted(engine) ? "dense-matvec" : "expert-mirror", device);
         if (ndevices == 2)
             fprintf(stderr, "v4_gpu peer=%d peer-mirrors=%d\n", peer, peer_capacity);
     }
@@ -12546,12 +12653,14 @@ static void *v4_gpu_upload_gate_bias(ColiDeepSeekV4LayerWeights *weights,
  * frees the 6.2 GiB the native tier otherwise uploads; the device is then the
  * routed-expert mirror/bank only. Default gpu (the 16 GB row in the docs).
  * Vendor-neutral on purpose: one switch, one meaning, no CUDA spelling. */
-static int v4_gpu_dense_wanted(void) {
+static int v4_gpu_dense_wanted(const ColiV4Engine *engine) {
+    const char *env = getenv("COLI_V4_DENSE_PLACE");
+    if (env)
+        return strcmp(env, "ram") != 0;   /* debug override, not the contract */
+    if (engine && engine->gpu.plan_valid)
+        return engine->gpu.plan_dense;
     static int place = -1;
-    if (place < 0) {
-        const char *env = getenv("COLI_V4_DENSE_PLACE");
-        place = !(env && !strcmp(env, "ram"));
-    }
+    if (place < 0) place = 1;
     return place;
 }
 
@@ -12562,7 +12671,7 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                                          engine->config.num_hidden_layers);
     if (owner < 0) return -1;
     int device = engine->gpu.devices[owner];
-    int dense = v4_gpu_dense_wanted();
+    int dense = v4_gpu_dense_wanted(engine);
     /* Dense in RAM still uploads the shared experts when the prefill bank is
      * asked for: dsv4_cuda_expert_bank_create takes them as its gate/up/down
      * operands, and without them the bank refuses with "no shared-expert
@@ -13802,11 +13911,11 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine) {
  * mirror, backend stub — falls back to the CPU union for the whole
  * generation. */
 int coli_v4_gpu_moe_batch_wanted(void) {
+    const char *setting = getenv("COLI_CUDA_MOE_BATCH");
+    if (setting) return atoi(setting) != 0;   /* debug override */
+    if (g_v4_gpu_plan_bank >= 0) return g_v4_gpu_plan_bank;
     static int wanted = -1;
-    if (wanted < 0) {
-        const char *setting = getenv("COLI_CUDA_MOE_BATCH");
-        wanted = setting && atoi(setting) != 0;
-    }
+    if (wanted < 0) wanted = 0;
     return wanted;
 }
 
@@ -13944,6 +14053,7 @@ static long long v4_gpu_mirror_reserve_mb(int live, long long *margin_mb) {
         if (env && explicit_mb < 256) explicit_mb = 256;
     }
     if (explicit_mb >= 0) return explicit_mb;
+    if (g_v4_gpu_plan_reserve_mb >= 0) return g_v4_gpu_plan_reserve_mb;
     long long reserve_mb = coli_v4_mirror_reserve_mb(
         v4_reserve_bank_bytes,
         v4_bank_double_usable() ? 2 : 1,
@@ -16950,6 +17060,11 @@ typedef struct {
     int stop_sentence;
     int no_dspark;
     double memory_gib;
+    int gpu_off;
+    int gpu_device;
+    int gpu_device_set;
+    double vram_gib;
+    int workload;
     ColiDeepSeekV4PromptMode prompt_mode;
 } V4CliOptions;
 
@@ -16960,6 +17075,9 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "       %s MODEL --oracle FILE [--teacher-forcing N] [--greedy N] [options]\n"
         "  --max-tokens N       maximum generated tokens (default: 128)\n"
         "  --memory-gb GiB      cap this process; otherwise use available RAM\n"
+        "  --gpu auto|none|N    device tier: auto (default), none, or ordinal\n"
+        "  --vram GiB           total VRAM budget for dense, bank and mirrors\n"
+        "  --workload MODE      auto|decode|prefill (default: auto)\n"
         "  --prompt-file PATH   read UTF-8 prompt from file (avoids argv encoding issues)\n"
         "  --system TEXT        optional system message\n"
         "  --thinking           enable the official V4 thinking prefix\n"
@@ -17048,6 +17166,38 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
         } else if (!strcmp(option, "--memory-gb")) {
             if (++i == argc || v4_cli_memory(argv[i], &options->memory_gib))
                 return -1;
+        } else if (!strcmp(option, "--gpu")) {
+            if (++i == argc || !argv[i][0]) return -1;
+            if (!strcmp(argv[i], "none")) {
+                options->gpu_off = 1;
+                options->gpu_device_set = 0;
+            } else if (!strcmp(argv[i], "auto")) {
+                options->gpu_off = 0;
+                options->gpu_device_set = 0;
+            } else {
+                char *end = NULL;
+                long value = strtol(argv[i], &end, 10);
+                if (end == argv[i] || *end || value < 0 || value > 64)
+                    return -1;
+                options->gpu_off = 0;
+                options->gpu_device = (int)value;
+                options->gpu_device_set = 1;
+            }
+        } else if (!strcmp(option, "--vram")) {
+            char *end = NULL;
+            double value;
+            if (++i == argc) return -1;
+            value = strtod(argv[i], &end);
+            if (!argv[i][0] || end == argv[i] || *end ||
+                value < 0.0 || value > 1048576.0)
+                return -1;
+            options->vram_gib = value;
+        } else if (!strcmp(option, "--workload")) {
+            if (++i == argc) return -1;
+            if (!strcmp(argv[i], "auto")) options->workload = 0;
+            else if (!strcmp(argv[i], "decode")) options->workload = 1;
+            else if (!strcmp(argv[i], "prefill")) options->workload = 2;
+            else return -1;
         } else if (!strcmp(option, "--prompt-file")) {
             if (++i == argc || !argv[i][0]) return -1;
             options->prompt_file = argv[i];
@@ -19731,6 +19881,18 @@ int main(int argc, char **argv) {
             /* Same contract as v4_serve_main: CTX sets the session plan;
              * unset or invalid falls back to the engine default (4096). */
             .context_tokens = getenv("CTX") ? atoi(getenv("CTX")) : 0,
+            .gpu_off = cli.gpu_off,
+            .gpu_device = cli.gpu_device,
+            .gpu_device_set = cli.gpu_device_set,
+            .gpu_budget_bytes = cli.vram_gib > 0.0
+                                    ? (uint64_t)(cli.vram_gib * 1073741824.0)
+                                    : 0,
+            /* One generated token means the prompt is the workload; the
+             * default generation is decode-first. An explicit --workload
+             * always wins. */
+            .gpu_workload = cli.workload
+                                ? cli.workload
+                                : (cli.max_new_tokens <= 1 ? 2 : 1),
         };
         if (cli.memory_gib > 0.0)
             open_opts.memory_limit_bytes =

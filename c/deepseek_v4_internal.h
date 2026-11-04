@@ -1216,6 +1216,20 @@ struct ColiV4Engine {
         int device_count;
         unsigned char layer_ready[COLI_V4_RESIDENT_MAX_LAYERS];
         long long uploaded_bytes;
+        /* Placement request copied from ColiV4EngineOpenOptions; the plan
+         * below is the single decision every tier reads. */
+        int request_off;
+        int request_device_set;
+        int request_device;
+        int request_workload;
+        long long request_budget_bytes;
+        int plan_valid;
+        int plan_dense;
+        int plan_shared;
+        int plan_bank;
+        int plan_attn;
+        int plan_mirror_slots;
+        long long plan_reserve_bytes;
         /* Optional opaque V4GpuExpertMirrorCache* for the dspark/MTP draft
          * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
          * unless V4_MTP_GPU=1 and the tier opened successfully. */
