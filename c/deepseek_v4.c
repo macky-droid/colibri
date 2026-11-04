@@ -12301,17 +12301,21 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         g_v4_gpu_plan_reserve_mb = plan.reserve_bytes >> 20;
         if (!getenv("COLI_CUDA_ATTN_BATCH"))
             coli_v4_gpu_attn_default = plan.attn;
-        fprintf(stderr,
-                "v4_gpu plan device=%d budget=%lldMiB free=%lldMiB "
-                "dense=%d shared=%d bank=%d attn=%d mirrors=%d "
-                "reserve=%lldMiB used=%lldMiB\n",
-                device, request.budget_bytes > 0
-                            ? (request.budget_bytes > free_bytes
-                                   ? free_bytes : request.budget_bytes) >> 20
-                            : free_bytes >> 20,
-                free_bytes >> 20, plan.dense, plan.shared, plan.bank,
-                plan.attn, plan.mirror_slots, plan.reserve_bytes >> 20,
-                plan.used_bytes >> 20);
+        {
+            long long plan_budget = request.budget_bytes > 0
+                                        ? request.budget_bytes
+                                        : free_bytes - request.safety_bytes;
+            if (plan_budget < 0) plan_budget = 0;
+            if (free_bytes > 0 && plan_budget > free_bytes)
+                plan_budget = free_bytes;
+            fprintf(stderr,
+                    "v4_gpu plan device=%d budget=%lldMiB free=%lldMiB "
+                    "dense=%d shared=%d bank=%d attn=%d mirrors=%d "
+                    "reserve=%lldMiB used=%lldMiB\n",
+                    device, plan_budget >> 20, free_bytes >> 20, plan.dense,
+                    plan.shared, plan.bank, plan.attn, plan.mirror_slots,
+                    plan.reserve_bytes >> 20, plan.used_bytes >> 20);
+        }
     } else {
         fprintf(stderr, "v4_gpu plan=off multi-device devices=%d; "
                         "contiguous-layer placement keeps its per-card budgets\n",
