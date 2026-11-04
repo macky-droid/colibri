@@ -48,13 +48,13 @@
 #else
 #define COLI_DSV4_TC 1
 #endif
-struct Dsv4CudaTensor { void *w,*bf16_cache; uint8_t *scale;int *dg_scale; int O,I,fmt,device,own_w,own_scale,own_dg_scale; long long bytes; };
-struct Dsv4CudaActivation { float *data; long long elements; int device; };
+struct Dsv4CudaTensor { void *w,*bf16_cache; uint8_t *scale;int *dg_scale; int O,I,fmt,device,own_w,own_scale,own_dg_scale; long long bytes; int charged; };
+struct Dsv4CudaActivation { float *data; long long elements; long long bytes; int device; int charged; };
 struct Dsv4CudaGraph { cudaGraph_t graph;cudaGraphExec_t exec;int device; };
-struct Dsv4CudaKvCache { float *kv,*compressed,*comp_value,*comp_score,*rope_cos,*rope_sin,*comp_cos,*comp_sin;int *compressed_len;int device,window,dim,max_tokens,max_compressed,rope_pairs; };
+struct Dsv4CudaKvCache { float *kv,*compressed,*comp_value,*comp_score,*rope_cos,*rope_sin,*comp_cos,*comp_sin;int *compressed_len;int device,window,dim,max_tokens,max_compressed,rope_pairs; long long charged_bytes; };
 struct MvDesc { const uint8_t *w,*scale; const float *x; float *y; };
 struct ExpertPtr { const uint8_t *w,*scale; };
-struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su,*sd;uint8_t *bank_fc1,*bank_fc1_scale,*bank_fc2,*bank_fc2_scale;int *bank_fc1_dg_scale,*bank_fc2_dg_scale;int count,device,H,I,vocab,topk; };
+struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su,*sd;uint8_t *bank_fc1,*bank_fc1_scale,*bank_fc2,*bank_fc2_scale;int *bank_fc1_dg_scale,*bank_fc2_dg_scale;int count,device,H,I,vocab,topk; long long charged_bytes; };
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
@@ -107,6 +107,13 @@ static void cuda_lost(const char*s,cudaError_t e){if(g_cuda_lost)return;g_cuda_l
 extern "C" int dsv4_cuda_lost(void){return g_cuda_lost;}
 static Dev *ctx(int d){if(g_cuda_lost)return nullptr;for(int i=0;i<ng;i++)if(g[i].id==d)return g+i;return nullptr;}
 static int ok(cudaError_t e,const char *s){if(e==cudaSuccess)return 1;fprintf(stderr,"[DSV4 CUDA] %s: %s\n",s,cudaGetErrorString(e));if(sticky(e))cuda_lost(s,e);return 0;}
+/* Per-device budget: the engine sets the plan budget before weights and the
+ * bank are uploaded, and every long-lived tensor, bank, KV cache and
+ * activation charges against it. Scratch buffers inside Dev stay outside:
+ * the plan reserve covers them, and they are not per-request allocations. */
+static long long g_budget[16], g_used[16];
+static int budget_charge(int device, long long bytes);
+static void budget_release(int device, long long bytes);
 #if COLI_DSV4_TC
 static int bok(cublasStatus_t e,const char*s){if(e==CUBLAS_STATUS_SUCCESS)return 1;fprintf(stderr,"[DSV4 CUDA] %s: cuBLAS status %d\n",s,(int)e);return 0;}
 #endif
@@ -1877,6 +1884,7 @@ static int init_fail(const int *dev,int n,int touched,int a,int b){
     for(int i=1;i<n;i++)if(dev[i]!=dev[0]&&cudaSetDevice(dev[i])==cudaSuccess)cudaDeviceReset();
     cudaGetLastError();return 0;}
 extern "C" int dsv4_cuda_init(const int *dev,int n){if(!dev||n<1||n>16||g_cuda_lost||ng)return 0;
+    for(int i=0;i<16;i++){g_budget[i]=0;g_used[i]=0;}
     for(int i=0;i<n;i++){
         cudaDeviceProp p{};
         /* name the refused device, and leave no stale error for the caller's next call */
@@ -1908,8 +1916,21 @@ extern "C" void dsv4_cuda_shutdown(void){
         g_kv_ring_rows[layer]=g_kv_comp_cap[layer]=0;
     }
     dev_release(ng);}
-extern "C" Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements){Dev*c=ctx(device);if(!c||elements<1||!ok(cudaSetDevice(device),"select activation device"))return nullptr;Dsv4CudaActivation*a=(Dsv4CudaActivation*)calloc(1,sizeof(*a));if(!a)return nullptr;a->device=device;a->elements=elements;if(!alloc_ok(cudaMalloc(&a->data,(size_t)elements*sizeof(float)),"activation allocation")){free(a);return nullptr;}return a;}
-extern "C" void dsv4_cuda_activation_free(Dsv4CudaActivation*a){if(!a)return;cudaSetDevice(a->device);cudaFree(a->data);free(a);}
+extern "C" Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements){
+    Dev*c=ctx(device);if(!c||elements<1||!ok(cudaSetDevice(device),"select activation device"))return nullptr;
+    long long bytes=(long long)elements*sizeof(float);
+    if(!budget_charge(device,bytes))return nullptr;
+    Dsv4CudaActivation*a=(Dsv4CudaActivation*)calloc(1,sizeof(*a));
+    if(!a){budget_release(device,bytes);return nullptr;}
+    a->device=device;a->elements=elements;a->bytes=bytes;
+    if(!alloc_ok(cudaMalloc(&a->data,(size_t)bytes),"activation allocation")){free(a);budget_release(device,bytes);return nullptr;}
+    a->charged=1;return a;
+}
+extern "C" void dsv4_cuda_activation_free(Dsv4CudaActivation*a){
+    if(!a)return;cudaSetDevice(a->device);cudaFree(a->data);
+    if(a->charged)budget_release(a->device,a->bytes);
+    free(a);
+}
 extern "C" int dsv4_cuda_activation_upload(Dsv4CudaActivation*a,const float*x,long long n){Dev*c=a?ctx(a->device):nullptr;if(!c||!x||n<0||n>a->elements||!ok(cudaSetDevice(a->device),"select activation upload device"))return 0;return ok(cudaMemcpyAsync(a->data,x,(size_t)n*sizeof(float),cudaMemcpyHostToDevice,c->stream),"activation upload");}
 extern "C" int dsv4_cuda_activation_download(float*x,const Dsv4CudaActivation*a,long long n){Dev*c=a?ctx(a->device):nullptr;if(!c||!x||n<0||n>a->elements||!ok(cudaSetDevice(a->device),"select activation download device"))return 0;return ok(cudaMemcpyAsync(x,a->data,(size_t)n*sizeof(float),cudaMemcpyDeviceToHost,c->stream),"activation download");}
 extern "C" int dsv4_cuda_activation_copy(Dsv4CudaActivation*dst,const Dsv4CudaActivation*src,long long n){Dev*c=dst?ctx(dst->device):nullptr,*s=src?ctx(src->device):nullptr;if(!c||!s||n<0||n>dst->elements||n>src->elements)return 0;
@@ -1949,16 +1970,50 @@ extern "C" void dsv4_cuda_graph_free(Dsv4CudaGraph*g){if(!g)return;cudaSetDevice
  * the caller as cudaMemcpy. */
 static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what){
     return ok(cudaMemcpyAsync(dst,src,n,cudaMemcpyHostToDevice,c->stream),what)&&ok(cudaStreamSynchronize(c->stream),what);}
-static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,size_t sb,int O,int I,int d,int fmt){if(*pt)return 1;Dev *c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select upload device"))return 0;Dsv4CudaTensor *t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));t->O=O;t->I=I;t->device=d;t->fmt=fmt;t->bytes=wb+sb;
-    if(!alloc_ok(cudaMalloc(&t->w,wb),"weight allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_w=1;if(!h2d(c,t->w,w,wb,"weight upload")){dsv4_cuda_tensor_free(t);return 0;}
-    if(sb){if(!alloc_ok(cudaMalloc(&t->scale,sb),"scale allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_scale=1;if(!h2d(c,t->scale,sc,sb,"scale upload")){dsv4_cuda_tensor_free(t);return 0;}}
+static int budget_charge(int device,long long bytes){
+    if(device<0||device>=16||bytes<=0)return 1;
+    if(g_budget[device]>0&&g_used[device]+bytes>g_budget[device])return 0;
+    g_used[device]+=bytes;return 1;
+}
+static void budget_release(int device,long long bytes){
+    if(device<0||device>=16||bytes<=0)return;
+    g_used[device]-=bytes;if(g_used[device]<0)g_used[device]=0;
+}
+extern "C" void dsv4_cuda_budget_set(int device,long long bytes){
+    if(device<0||device>=16)return;
+    g_budget[device]=bytes>0?bytes:0;
+}
+extern "C" long long dsv4_cuda_budget_used(int device){
+    return device>=0&&device<16?g_used[device]:0;
+}
+static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,size_t sb,int O,int I,int d,int fmt){
+    if(*pt)return 1;
+    Dev *c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select upload device"))return 0;
+    long long total=(long long)wb+sb;
 #ifdef COLI_DSV4_DEEPGEMM
-    if((fmt==8||fmt==9)&&O%128==0&&I%128==0){size_t db=(size_t)O*(I/128/4)*sizeof(int);if(!alloc_ok(cudaMalloc(&t->dg_scale,db),"dense DeepGEMM scale allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_dg_scale=1;
+    if((fmt==8||fmt==9)&&O%128==0&&I%128==0)
+        total+=(long long)O*(I/128/4)*sizeof(int);
+#endif
+    if(!budget_charge(d,total))return 0;
+    Dsv4CudaTensor *t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));
+    if(!t){budget_release(d,total);return 0;}
+    t->O=O;t->I=I;t->device=d;t->fmt=fmt;t->bytes=total;t->charged=1;
+    if(!alloc_ok(cudaMalloc(&t->w,wb),"weight allocation")){dsv4_cuda_tensor_free(t);return 0;}
+    t->own_w=1;if(!h2d(c,t->w,w,wb,"weight upload")){dsv4_cuda_tensor_free(t);return 0;}
+    if(sb){if(!alloc_ok(cudaMalloc(&t->scale,sb),"scale allocation")){dsv4_cuda_tensor_free(t);return 0;}
+        t->own_scale=1;if(!h2d(c,t->scale,sc,sb,"scale upload")){dsv4_cuda_tensor_free(t);return 0;}}
+#ifdef COLI_DSV4_DEEPGEMM
+    if((fmt==8||fmt==9)&&O%128==0&&I%128==0){
+        size_t db=(size_t)O*(I/128/4)*sizeof(int);
+        if(!alloc_ok(cudaMalloc(&t->dg_scale,db),"dense DeepGEMM scale allocation")){dsv4_cuda_tensor_free(t);return 0;}
+        t->own_dg_scale=1;
         if(fmt==9){int groups=O/1024;dg_pack_batched_scale<<<(O*(I/128/4)+255)/256,256,0,c->stream>>>(t->dg_scale,t->scale,O/groups,I/128,groups);}
         else dg_pack_dense_scale<<<(O*(I/128/4)+255)/256,256,0,c->stream>>>(t->dg_scale,t->scale,O,I/128);
-        if(!ok(cudaGetLastError(),"dense DeepGEMM scale packing")){dsv4_cuda_tensor_free(t);return 0;}t->bytes+=db;}
+        if(!ok(cudaGetLastError(),"dense DeepGEMM scale packing")){dsv4_cuda_tensor_free(t);return 0;}
+    }
 #endif
-    *pt=t;return 1;}
+    *pt=t;return 1;
+}
 extern "C" int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t,const uint8_t*w,const uint8_t*s,int O,int I,int d){return upload(t,w,(size_t)O*I,s,(size_t)((O+127)/128)*((I+127)/128),O,I,d,8);}
 extern "C" int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **t,const uint8_t*w,const float*s,int O,int I,int packed,int d){
     if(!t||!w||!s||O<1||I<1||I%128||(packed!=0&&packed!=1)||(packed&&O%8))return 0;
@@ -2174,6 +2229,9 @@ extern "C" Dsv4CudaKvCache *dsv4_cuda_kv_create(int device, int window, int dim,
     k->rope_pairs = rope_pairs;
     size_t kb = (size_t)window * dim * 4, cb = (size_t)k->max_compressed * dim * 4, pb = (size_t)2 * window * dim * 4,
            rb = (size_t)max_tokens * rope_pairs * 4;
+    long long total = (long long)kb + cb + sizeof(int) + 2LL * pb + 4LL * rb;
+    if (!budget_charge(device, total)) { free(k); return nullptr; }
+    k->charged_bytes = total;
     if (!ok(cudaMalloc(&k->kv, kb), "KV allocation") || !ok(cudaMemset(k->kv, 0, kb), "KV clear") ||
         !ok(cudaMalloc(&k->compressed, cb), "compressed KV allocation") ||
         !ok(cudaMalloc(&k->compressed_len, sizeof(int)), "compressed length allocation") ||
@@ -2250,6 +2308,7 @@ extern "C" void dsv4_cuda_kv_free(Dsv4CudaKvCache *k) {
     if (k->rope_sin) cudaFree(k->rope_sin);
     if (k->comp_cos) cudaFree(k->comp_cos);
     if (k->comp_sin) cudaFree(k->comp_sin);
+    if (k->charged_bytes) budget_release(k->device, k->charged_bytes);
     free(k);
 }
 extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4CudaTensor *an, Dsv4CudaTensor *qa,
@@ -3012,7 +3071,10 @@ extern "C" Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const 
     }
     Dsv4CudaExpertSet *set=(Dsv4CudaExpertSet*)calloc(1,sizeof(*set));if(!set){free(host);return nullptr;}
     set->count=count;set->device=device;set->H=H;set->I=I;set->sg=sg;set->su=su;set->sd=sd;
-    size_t bytes=(size_t)3*count*sizeof(*host);Dev*tc=ctx(device);if(!tc||!ok(cudaMalloc(&set->table,bytes),"expert table allocation")||
+    size_t bytes=(size_t)3*count*sizeof(*host);
+    if(!budget_charge(device,(long long)bytes)){free(host);free(set);return nullptr;}
+    set->charged_bytes=(long long)bytes;
+    Dev*tc=ctx(device);if(!tc||!ok(cudaMalloc(&set->table,bytes),"expert table allocation")||
        !h2d(tc,set->table,host,bytes,"expert table upload")){free(host);dsv4_cuda_expert_set_free(set);return nullptr;}
     free(host);return set;
 }
@@ -3052,6 +3114,12 @@ extern "C" Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int H,int I
     set->count=count;set->device=device;set->H=H;set->I=I;set->sg=sg;set->su=su;set->sd=sd;
     size_t fc1_w=(size_t)count*I*H,fc1_s=(size_t)count*2*I*(H/32);
     size_t fc2_w=(size_t)count*H*(I/2),fc2_s=(size_t)count*H*(I/32);
+    long long total=(long long)fc1_w+fc1_s+fc2_w+fc2_s+3LL*count*(long long)sizeof(ExpertPtr);
+#ifdef COLI_DSV4_DEEPGEMM
+    total+=(long long)fc1_s+fc2_s;
+#endif
+    if(!budget_charge(device,total)){free(set);return nullptr;}
+    set->charged_bytes=total;
     if(!ok(cudaMalloc(&set->bank_fc1,fc1_w),"expert FC1 bank allocation")||
        !ok(cudaMalloc(&set->bank_fc1_scale,fc1_s),"expert FC1 scale bank allocation")||
        !ok(cudaMalloc(&set->bank_fc2,fc2_w),"expert FC2 bank allocation")||
@@ -3217,7 +3285,7 @@ extern "C" int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet*set,int e,int 
 #endif
     return 1;
 }
-extern "C" void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet*set){if(!set)return;cudaSetDevice(set->device);if(set->table)cudaFree(set->table);if(set->hash)cudaFree(set->hash);if(set->bank_fc1)cudaFree(set->bank_fc1);if(set->bank_fc1_scale)cudaFree(set->bank_fc1_scale);if(set->bank_fc2)cudaFree(set->bank_fc2);if(set->bank_fc2_scale)cudaFree(set->bank_fc2_scale);if(set->bank_fc1_dg_scale)cudaFree(set->bank_fc1_dg_scale);if(set->bank_fc2_dg_scale)cudaFree(set->bank_fc2_dg_scale);free(set);}
+extern "C" void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet*set){if(!set)return;cudaSetDevice(set->device);if(set->table)cudaFree(set->table);if(set->hash)cudaFree(set->hash);if(set->bank_fc1)cudaFree(set->bank_fc1);if(set->bank_fc1_scale)cudaFree(set->bank_fc1_scale);if(set->bank_fc2)cudaFree(set->bank_fc2);if(set->bank_fc2_scale)cudaFree(set->bank_fc2_scale);if(set->bank_fc1_dg_scale)cudaFree(set->bank_fc1_dg_scale);if(set->bank_fc2_dg_scale)cudaFree(set->bank_fc2_dg_scale);if(set->charged_bytes)budget_release(set->device,set->charged_bytes);free(set);}
 /* Rebind the shared-expert mirrors on a bank set. The bank is a per-layer
  * streaming buffer during batched prefill, but the shared experts differ per
  * layer and are already resident as the layer's fp8 mirrors — rebinding them
@@ -3665,6 +3733,6 @@ extern "C" int dsv4_cuda_wo(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,flo
 }
 /* A latched-off peer's context may refuse the frees (sticky fault): read the
  * error so the next launch check does not report it. */
-extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);if(dev_lost(t->device))cudaGetLastError();free(t);}
+extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);if(t->charged)budget_release(t->device,t->bytes);if(dev_lost(t->device))cudaGetLastError();free(t);}
 extern "C" long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor*t){return t?t->bytes:0;}
 extern "C" int dsv4_cuda_tensor_device(const Dsv4CudaTensor*t){return t?t->device:-1;}
