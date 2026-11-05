@@ -85,3 +85,5 @@ libcoli_xdna.so
 shaders/chain_dnconv_rows.spv
 shaders/qmatmul_bd.spv
 shaders/qmatmul_gate_up_bd.spv
+# The native V4 HIP/CUDA backend library (Linux), loaded with dlopen
+coli_gpu_dsv4.so
