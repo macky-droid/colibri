@@ -105,12 +105,13 @@ static bool dev_ok(int a,int b){return !g_cuda_lost&&(a==b||(a>=0&&a<16&&b>=0&&b
  * (the F18 probe). g_cuda_lost latches on the first one: from then on ctx()
  * answers no device, so every entry point refuses without touching CUDA and
  * the engine takes its host paths (dsv4_cuda_lost) until the process ends. */
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
-static bool sticky(cudaError_t e){switch(e){case hipErrorIllegalAddress:case hipErrorLaunchFailure:case hipErrorAssert:return true;default:return false;}}
-#else
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
 static bool sticky(cudaError_t e){switch(e){case cudaErrorIllegalAddress:case cudaErrorLaunchFailure:case cudaErrorHardwareStackError:
     case cudaErrorIllegalInstruction:case cudaErrorMisalignedAddress:case cudaErrorInvalidAddressSpace:case cudaErrorInvalidPc:
     case cudaErrorAssert:case cudaErrorLaunchTimeout:case cudaErrorECCUncorrectable:return true;default:return false;}}
+#else
+/* HIP reports fewer fatal classes than CUDA: the ones it names are the same faults. */
+static bool sticky(cudaError_t e){switch(e){case hipErrorIllegalAddress:case hipErrorLaunchFailure:case hipErrorAssert:return true;default:return false;}}
 #endif
 static void cuda_lost(const char*s,cudaError_t e){if(g_cuda_lost)return;g_cuda_lost=1;
     fprintf(stderr,"[DSV4 CUDA] %s: %s is a sticky fault: CUDA is lost for this process, on every device; the GPU paths "
