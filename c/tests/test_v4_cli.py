@@ -389,7 +389,7 @@ class V4CliTest(unittest.TestCase):
         )
         family = types.SimpleNamespace(
             id="deepseek_v4", modality="text", has_gateway_adapter=True,
-            display_name="DeepSeek V4",
+            display_name="DeepSeek V4", tune_renders_chat=False,
         )
         captured = {}
 
