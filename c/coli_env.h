@@ -560,7 +560,6 @@ static const ColiEnvVar coli_env_table[] = {
     {"DSV4_CUDA_WO_DECODE", CE_BOOL, CE_DSV4, 0, NULL},
     {"DSV4_DECODE_PROF",                 CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_HEAD_VERIFY", CE_BOOL, CE_DSV4, 0, NULL},
-    {"DSV4_HYBRID",                      CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_IDX_VERIFY",                  CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_MM_WARP", CE_INT, CE_DSV4, 0, NULL},
     {"DSV4_MM_WARP_VERIFY", CE_INT, CE_DSV4, 0, NULL},

@@ -35,6 +35,18 @@ int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size) {
 }
 int dsv4_cuda_lost(void) { return 0; }
 int coli_v4_hybrid_enabled(void) { return 0; }
+int g_v4_gpu_plan_hybrid = -1;
+/* The placement plan reads the layer geometry from another unit and charges the
+ * backend's budget; this test needs neither: no estimate (the engine falls back to
+ * the resident size) and a budget that is only recorded. */
+int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan, const ColiDeepSeekV4Config *config,
+                       int layer, char *error, size_t error_size) {
+    (void)plan; (void)config; (void)layer; (void)error; (void)error_size;
+    return -1;
+}
+static long long budget_set_to[16];
+void dsv4_cuda_budget_set(int device, long long bytes) { budget_set_to[device] = bytes; }
+long long dsv4_cuda_budget_used(int device) { (void)device; return 0; }
 int coli_v4_gpu_resident_first(void) { return 0; }
 void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
                                        unsigned char *held, int experts);

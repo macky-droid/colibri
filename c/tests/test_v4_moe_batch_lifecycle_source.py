@@ -84,7 +84,14 @@ class V4MoeBatchLifecycleSourceTest(unittest.TestCase):
     def test_generate_prefill_passes_1_and_decode_passes_0(self):
         where = "session_generate_impl"
         body = function_body(self.text, "static int session_generate_impl(")
-        release = find(body, "coli_v4_gpu_moe_batch_release();", where=where)
+        # The release between the prefill and the decode passes is made by the
+        # phase switch (coli_v4_gpu_phase_begin(engine, 0, 0)): its decode
+        # branch frees the bank before it restores the decode shape.
+        release = find(body, "coli_v4_gpu_phase_begin(engine, 0, 0);", where=where)
+        phase = function_body(self.text, "void coli_v4_gpu_phase_begin(")
+        decode = find(phase, "} else {", where="coli_v4_gpu_phase_begin")
+        find(phase, "coli_v4_gpu_moe_batch_release();", decode,
+             where="coli_v4_gpu_phase_begin, decode branch")
         calls = [match.start() for match in
                  re.finditer(r"\btarget_batch\(", body)]
         self.assertTrue(any(at < release for at in calls),
