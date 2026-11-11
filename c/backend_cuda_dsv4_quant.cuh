@@ -1,14 +1,26 @@
 #pragma once
 
 #include <stdint.h>
+#include "backend_gpu_compat.h"
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_fp8.h>
+#include <hip/hip_runtime.h>
+#else
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#endif
 
 /* Native conversion follows the same approach as Naruto's
  * cuda_deepseek_quantization.cuh. Keep Colibri's ties-to-even and positive
  * zero convention; Naruto's software encoder uses a different tie rule. */
 __device__ __forceinline__ float e4m3(uint8_t bits) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    unsigned exponent = (bits >> 3) & 15, mantissa = bits & 7;
+    float value = exponent ? __uint_as_float(((exponent + 120) << 23) |
+                                            (mantissa << 20))
+                           : mantissa * 0.001953125f;
+    return exponent == 15 && mantissa == 7 ? NAN : bits & 128 ? -value : value;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     return __half2float(__nv_cvt_fp8_to_halfraw(bits, __NV_E4M3));
 #else
     unsigned exponent = (bits >> 3) & 15, mantissa = bits & 7;

@@ -84,6 +84,16 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaError_t              hipError_t
 #define cudaSuccess              hipSuccess
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
+#define cudaErrorNoKernelImageForDevice hipErrorNoBinaryForGpu
+#define cudaErrorInvalidDeviceFunction hipErrorInvalidDeviceFunction
+#define cudaErrorLaunchFailure hipErrorLaunchFailure
+#define cudaErrorLaunchOutOfResources hipErrorLaunchOutOfResources
+#define cudaDeviceReset hipDeviceReset
+typedef hipFuncAttributes cudaFuncAttributes;
+#define cudaFuncGetAttributes hipFuncGetAttributes
+#define cudaDevAttrCooperativeLaunch hipDeviceAttributeCooperativeLaunch
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
+#define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 #define cudaErrorNotReady        hipErrorNotReady
 #define cudaGetErrorString       hipGetErrorString
 #define cudaGetLastError         hipGetLastError
