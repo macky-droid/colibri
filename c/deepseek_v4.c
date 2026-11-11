@@ -13033,7 +13033,8 @@ void coli_v4_gpu_phase_begin(ColiV4Engine *engine, int prefill,
             return;
         }
         if (!engine->gpu.plan_prefill.dense &&
-            !engine->gpu.plan_prefill.shared)
+            !engine->gpu.plan_prefill.shared &&
+            !engine->gpu.plan_prefill.bank)
             return;
         /* Dense upload needs the mirror VRAM; the decode set refills on
          * demand after the prefill. */
