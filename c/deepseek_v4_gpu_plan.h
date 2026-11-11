@@ -37,6 +37,7 @@ typedef struct {
     long long kv_bytes;      /* context/KV/work estimate */
     long long mirror_bytes;  /* one decode expert mirror (gate+up+down) */
     int n_experts;           /* routed experts (132, 256, ...) */
+    int hybrid_off;          /* 1: a feature the user asked for explicitly excludes the split */
 } V4GpuPlanRequest;
 
 typedef struct {
@@ -191,7 +192,8 @@ static inline V4GpuPlan v4_gpu_plan_decide(const V4GpuPlanRequest *request) {
      * GPU decode plan with a live mirror set uses it; prefill and a CPU plan
      * do not. This keeps the choice in one place for every VRAM size. */
     plan.hybrid = phase == V4_GPU_WORKLOAD_DECODE &&
-                  plan.mirror_slots >= V4_GPU_PLAN_MIN_MIRRORS;
+                  plan.mirror_slots >= V4_GPU_PLAN_MIN_MIRRORS &&
+                  !request->hybrid_off;
     return plan;
 }
 

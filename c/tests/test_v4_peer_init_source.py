@@ -3,10 +3,11 @@
 tests/test_dsv4_peer_init_cuda.cu checks the behaviour on real GPUs; this
 pins the shape that a CPU-only CI host can see:
 
-- the engine settles the peer pool BEFORE any init (DSV4_HYBRID=1 first, then
-  the DSV4_CUDA_PEER_MIRRORS capacity, then dsv4_cuda_peer_probe), so a
-  refused peer is never initialised, and the probe refuses a latched-off peer
-  and checks the primary before it touches the peer;
+- the engine settles the peer pool BEFORE any init (the DSV4_CUDA_PEER_MIRRORS
+  capacity, then dsv4_cuda_peer_probe), so a refused peer is never
+  initialised, and the probe refuses a latched-off peer and checks the
+  primary before it touches the peer. The decode split no longer takes part:
+  a peer device set leaves it off in the plan (hybrid_off);
 - it never calls dsv4_cuda_shutdown() between the failed two-device init and
   the single-device retry (on Windows the loader's shutdown unloads the DLL);
 - with the peer unset the engine makes exactly one init,
@@ -38,11 +39,10 @@ class V4PeerInitSourceTest(unittest.TestCase):
 
     def test_the_peer_is_settled_before_any_init(self):
         body = self.open_body()
-        hybrid = body.index("coli_v4_hybrid_enabled()")
+        self.assertNotIn("DSV4_HYBRID", body)
         capacity = body.index("peer_capacity = v4_peer_mirrors_capacity()")
         probe = body.index("dsv4_cuda_peer_probe(device, peer,")
         pair = body.index("dsv4_cuda_init(devices, 2)")
-        self.assertLess(hybrid, capacity)
         self.assertLess(capacity, probe)
         self.assertLess(probe, pair)
         self.assertEqual(body.count("dsv4_cuda_init("), 3)

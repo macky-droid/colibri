@@ -514,9 +514,10 @@ conversations together, `KV_SLOTS`) go through the expert union and use
 neither (with the default `V4_EXPERT_UNION=1`; with `0` they run token by
 token and use both). The RAM pin ranking still leaves mirrored experts out
 on those paths and during prefill, as long as `V4_GPU_RESIDENT_FIRST=1` is
-set. `DSV4_HYBRID=1` turns `V4_GPU_RESIDENT_FIRST` off and
-uploads its split's experts into the primary cache only, so no peer pool is
-set up there: GPU N is left untouched, and a warning says so.
+set. The decode split of cache misses (`V4GpuPlan.hybrid`, on for a GPU decode
+plan) uploads its experts into the primary cache only, so it yields to both
+levers: with `V4_GPU_RESIDENT_FIRST=1` or `DSV4_CUDA_PEER_DEVICE` set the plan
+leaves the split off.
 
 Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
 `--ram 40`, six 300-token answers per run, greedy), with `COLI_CUDA_MOE_BATCH=1`
@@ -800,8 +801,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_MOE_EM_TB` (auto, `.cu`) | routes per pass of the expert-major kernel: unset = 2 below 4 routes per routed expert in the chunk, else 4; `2`, `3`, `4` or `6` forces one (anything else is ignored with a warning) |
 | `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul, fp8 shapes whose I is a multiple of 256: warp-per-row kernel for I ≤ 1024 (unset, empty or `auto`), `1` = all of them, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit (keeps the old kernel's results, also with `0`) |
 | `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: switch (layer change: prefetch-worker wait, bank swap) / route / refill / compute ms |
-| `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); off under `DSV4_HYBRID=1` |
-| `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; unused under `DSV4_HYBRID=1`) |
+| `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); the plan leaves the decode split off when it is set |
+| `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; the plan leaves the decode split off when it is set) |
 | `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU (both GPUs at the same SM version; `mode=` in the `peer-mirrors` line); `0` = read them in place over P2P; no effect with `DSV4_CUDA_BATCHED=0`, which reads them in place |
 | `DSV4_CUDA_PEER_FAULT` (unset, `.cu`) | tests: `n` = the n-th peer-compute pass fails at its join with an error the devices survive, and the peer is latched off (that call recomputes on the primary); `n:lost` = the peer also counts as lost (the call fails, decode takes host copies); `n:sticky` = the error is a kernel fault's, which latches CUDA off for the whole process (every later call refused, host paths), as a real fault does |
 | `DSV4_CUDA_PEER_MIRRORS` (4096) / `DSV4_CUDA_PEER_RESERVE_MB` (1024) | upper bound on peer pool mirrors (12.75 MiB each; free VRAM sizes the pool), minimum 8 (a smaller or non-numeric value leaves the pool off) / VRAM kept free on the peer |

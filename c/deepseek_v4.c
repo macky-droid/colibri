@@ -12207,17 +12207,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
              * never initialised (no context, streams or buffers held on it for
              * the whole run). */
             char why[320];
-            if (peer != device && coli_v4_hybrid_enabled()) {
-                static int hybrid_said;
-                if (!hybrid_said) {
-                    hybrid_said = 1;
-                    fprintf(stderr, "v4_gpu warning=peer mirror pool off: DSV4_HYBRID=1 "
-                                    "uploads decode misses into device %d's mirrors only "
-                                    "(and keeps V4_GPU_RESIDENT_FIRST off), so a pool on "
-                                    "device %d would stay empty; device %d left unused\n",
-                            device, peer, peer);
-                }
-            } else if (!(peer_capacity = v4_peer_mirrors_capacity())) {
+            if (!(peer_capacity = v4_peer_mirrors_capacity())) {
                 /* v4_peer_mirrors_capacity said why */
             } else if (!dsv4_cuda_peer_probe(device, peer, why, (int)sizeof why)) {
                 fprintf(stderr, "v4_gpu warning=peer mirror pool off: %s\n", why);
@@ -12317,6 +12307,14 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         request.mirror_bytes = mirror_bytes;
         request.n_experts = engine->config.n_routed_experts;
         request.safety_bytes = V4_GPU_PLAN_DEFAULT_SAFETY_BYTES;
+        /* The split used to be an opt-in environment switch that VRAM-first
+         * decode and the peer mirror pool were written to yield to. It is now
+         * on for a GPU decode plan, so those two win instead: a user who asked
+         * for either keeps it, and the plan leaves the split off. */
+        {
+            const char *peer = getenv("DSV4_CUDA_PEER_DEVICE");
+            request.hybrid_off = coli_v4_gpu_resident_first() || (peer && *peer);
+        }
         plan_budget = request.budget_bytes > 0
                           ? request.budget_bytes
                           : free_bytes - request.safety_bytes;
@@ -13032,9 +13030,10 @@ void coli_v4_gpu_phase_begin(ColiV4Engine *engine, int prefill,
                         (phase_t1.tv_nsec - phase_t0.tv_nsec) * 1e-9);
             return;
         }
+        /* The plan sets the bank only beside dense or shared experts, so
+         * these two already cover every prefill shape that needs a switch. */
         if (!engine->gpu.plan_prefill.dense &&
-            !engine->gpu.plan_prefill.shared &&
-            !engine->gpu.plan_prefill.bank)
+            !engine->gpu.plan_prefill.shared)
             return;
         /* Dense upload needs the mirror VRAM; the decode set refills on
          * demand after the prefill. */
@@ -13660,7 +13659,9 @@ int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size) 
      * preload is a budget refusal, not a hard failure: auto keeps the cache. */
     if (engine->gpu.plan_valid && !engine->gpu.plan_dense &&
         !engine->gpu.plan_shared && !engine->gpu.plan_bank) {
-        if (error && size) error[0] = '\0';
+        if (error && size)
+            snprintf(error, size, "the GPU plan keeps dense and shared experts in RAM "
+                                  "(a decode plan below 10 GiB); use --workload prefill or more --vram");
         return 1;
     }
     int intermediate = engine->config.moe_intermediate_size;

@@ -150,6 +150,17 @@ int main(void) {
               p.mirror_slots == 0, "backend off", 24, r.workload, 132);
     }
 
+    {   /* The decode split is allowed on a GPU decode plan with mirrors; a feature the
+         * user asked for explicitly (VRAM-first decode, a peer pool) refuses it. */
+        V4GpuPlanRequest r = request(6 * GIB, V4_GPU_WORKLOAD_DECODE, 132);
+        check(v4_gpu_plan_decide(&r).hybrid == 1, "decode plan allows the split", 6, r.workload, 132);
+        r.hybrid_off = 1;
+        check(v4_gpu_plan_decide(&r).hybrid == 0, "hybrid_off refuses the split", 6, r.workload, 132);
+        r.hybrid_off = 0;
+        r.workload = V4_GPU_WORKLOAD_PREFILL;
+        check(v4_gpu_plan_decide(&r).hybrid == 0, "prefill never splits", 6, r.workload, 132);
+    }
+
     if (failures) {
         fprintf(stderr, "v4 gpu plan: %d failure(s)\n", failures);
         return 1;
