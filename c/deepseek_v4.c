@@ -12938,6 +12938,8 @@ int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
     if (scores)
         return dsv4_cuda_head_scores_batch_exact(engine->gpu.head, input, batch, scores) ? 0 : -1;
     return dsv4_cuda_head_argmax_batch_exact(engine->gpu.head, input, batch, ids, values) ? 0 : -1;
+}
+
 /* ---- phase placement -------------------------------------------------
  * The plan has a decode and a prefill shape. On 8 GB they cannot both be
  * resident: prefill wants dense+attention on the card, decode wants the
@@ -13256,6 +13258,7 @@ struct V4GpuExpertMirrorCache {
     int capacity;
     int limit;      /* active plan's mirror count; capacity is the array size */
     int count;
+    uint64_t clock; /* monotonic age for the linear fallback */
     int device;
     int first_layer, end_layer;
     int experts_per_layer; /* nonzero: immutable, directly indexed resident table */
@@ -13284,7 +13287,7 @@ struct V4GpuExpertMirrorCache {
     int n_layers, n_experts;
     int *slot_map;
     int *key_of;
-    int *prev, *next;
+    int *slru_prev, *slru_next;
     int head[2], tail[2];
     unsigned char *is_protected;
     int n_protected;
@@ -13411,8 +13414,8 @@ static void v4_gpu_expert_mirrors_slru_reset(
         cache->slot_map[i] = -1;
     for (int s = 0; s < cache->capacity; s++) {
         cache->key_of[s] = -1;
-        cache->prev[s] = s - 1;
-        cache->next[s] = s + 1 < cache->capacity ? s + 1 : -1;
+        cache->slru_prev[s] = s - 1;
+        cache->slru_next[s] = s + 1 < cache->capacity ? s + 1 : -1;
         cache->is_protected[s] = 0;
     }
     cache->head[0] = cache->capacity > 0 ? 0 : -1;
@@ -13425,27 +13428,27 @@ static void v4_gpu_expert_mirrors_set_dims(V4GpuExpertMirrorCache *cache,
                                            int n_layers, int n_experts) {
     if (!cache || n_layers < 1 || n_experts < 1) return;
     free(cache->slot_map); free(cache->key_of);
-    free(cache->prev); free(cache->next);
+    free(cache->slru_prev); free(cache->slru_next);
     free(cache->is_protected); free(cache->seen);
     cache->slot_map = NULL; cache->key_of = NULL;
-    cache->prev = cache->next = NULL;
+    cache->slru_prev = cache->slru_next = NULL;
     cache->is_protected = NULL; cache->seen = NULL;
     cache->n_layers = n_layers; cache->n_experts = n_experts;
     cache->slot_map = malloc((size_t)n_layers * n_experts *
                              sizeof(*cache->slot_map));
     cache->key_of = malloc((size_t)cache->capacity * sizeof(*cache->key_of));
-    cache->prev = malloc((size_t)cache->capacity * sizeof(*cache->prev));
-    cache->next = malloc((size_t)cache->capacity * sizeof(*cache->next));
+    cache->slru_prev = malloc((size_t)cache->capacity * sizeof(*cache->slru_prev));
+    cache->slru_next = malloc((size_t)cache->capacity * sizeof(*cache->slru_next));
     cache->is_protected = malloc((size_t)cache->capacity *
                                  sizeof(*cache->is_protected));
     cache->seen = calloc((size_t)n_experts, sizeof(*cache->seen));
-    if (!cache->slot_map || !cache->key_of || !cache->prev || !cache->next ||
+    if (!cache->slot_map || !cache->key_of || !cache->slru_prev || !cache->slru_next ||
         !cache->is_protected || !cache->seen) {
         free(cache->slot_map); free(cache->key_of);
-        free(cache->prev); free(cache->next);
+        free(cache->slru_prev); free(cache->slru_next);
         free(cache->is_protected); free(cache->seen);
         cache->slot_map = NULL; cache->key_of = NULL;
-        cache->prev = cache->next = NULL;
+        cache->slru_prev = cache->slru_next = NULL;
         cache->is_protected = NULL; cache->seen = NULL;
         return;
     }
@@ -13456,18 +13459,18 @@ static void v4_gpu_expert_mirrors_slru_move(
         V4GpuExpertMirrorCache *cache, int slot, int protect) {
     int from = cache->is_protected[slot];
     if (from == protect && slot == cache->tail[from]) return;
-    if (cache->prev[slot] >= 0)
-        cache->next[cache->prev[slot]] = cache->next[slot];
+    if (cache->slru_prev[slot] >= 0)
+        cache->slru_next[cache->slru_prev[slot]] = cache->slru_next[slot];
     else
-        cache->head[from] = cache->next[slot];
-    if (cache->next[slot] >= 0)
-        cache->prev[cache->next[slot]] = cache->prev[slot];
+        cache->head[from] = cache->slru_next[slot];
+    if (cache->slru_next[slot] >= 0)
+        cache->slru_prev[cache->slru_next[slot]] = cache->slru_prev[slot];
     else
-        cache->tail[from] = cache->prev[slot];
-    cache->prev[slot] = cache->tail[protect];
-    cache->next[slot] = -1;
+        cache->tail[from] = cache->slru_prev[slot];
+    cache->slru_prev[slot] = cache->tail[protect];
+    cache->slru_next[slot] = -1;
     if (cache->tail[protect] >= 0)
-        cache->next[cache->tail[protect]] = slot;
+        cache->slru_next[cache->tail[protect]] = slot;
     else
         cache->head[protect] = slot;
     cache->tail[protect] = slot;
@@ -13499,7 +13502,7 @@ static int v4_gpu_expert_mirrors_slru_victim(
         V4GpuExpertMirrorCache *cache, int layer) {
     for (int segment = 0; segment < 2; segment++) {
         for (int slot = cache->head[segment]; slot >= 0;
-             slot = cache->next[slot]) {
+             slot = cache->slru_next[slot]) {
             if (slot >= cache->limit || slot >= cache->count) continue;
             int key = cache->key_of[slot];
             if (key < 0) return slot;
@@ -13539,7 +13542,7 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     pthread_mutex_destroy(&cache->mutex);
     free(cache->entries);
     free(cache->slot_map); free(cache->key_of);
-    free(cache->prev); free(cache->next);
+    free(cache->slru_prev); free(cache->slru_next);
     free(cache->is_protected); free(cache->seen);
     free(cache);
 }
@@ -13651,6 +13654,14 @@ int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size) 
     int layers = engine->config.num_hidden_layers;
     int experts = engine->config.n_routed_experts;
     int hidden = engine->config.hidden_size;
+    /* A decode-only plan (8 GB: dense and shared experts stay in RAM, the
+     * VRAM is the mirror cache) has no shared-expert mirrors to preload. The
+     * preload is a budget refusal, not a hard failure: auto keeps the cache. */
+    if (engine->gpu.plan_valid && !engine->gpu.plan_dense &&
+        !engine->gpu.plan_shared && !engine->gpu.plan_bank) {
+        if (error && size) error[0] = '\0';
+        return 1;
+    }
     int intermediate = engine->config.moe_intermediate_size;
     if (layers < 1 || layers > COLI_V4_RESIDENT_MAX_LAYERS ||
         engine->gpu.device_count < 1 || engine->gpu.device_count > layers ||
